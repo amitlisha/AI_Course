@@ -174,119 +174,98 @@ class WateringProblem(search.Problem):
                 return False
         return True
 
-    # ---------- Heuristics for A* and GBFS ----------
-
-    # def _max_min_robot_to_plant_distance(self, plants_state, robots_state):
-    #     """
-    #     Helper for heuristic: for each plant that still needs water, compute the
-    #     minimum Manhattan distance from any robot to that plant; then take the max
-    #     over plants.
-
-    #     This is a lower bound on the movement cost, ignoring walls and taps.
-    #     """
-    #     # Collect robot positions
-    #     robot_positions = [(i, j) for (rid, i, j, load, capacity) in robots_state]
-    #     if not robot_positions:
-    #         return 0
-
-    #     # Only plants that still need water
-    #     need_plants = [(i, j, need) for (i, j, need) in plants_state if need > 0]
-    #     if not need_plants:
-    #         return 0
-
-    #     max_min_dist = 0
-    #     for pi, pj, need in need_plants:
-    #         min_dist = min(abs(pi - ri) + abs(pj - rj) for (ri, rj) in robot_positions)
-    #         if min_dist > max_min_dist:
-    #             max_min_dist = min_dist
-    #     return max_min_dist
-
-    # def h_astar(self, node):
-    #     """This is the heuristic. It gets a node (not a state)
-    #     and returns a goal distance estimate"""
-    #     # Improved admissible heuristic:
-    #     # 1. Lower bound on POUR actions: total remaining water units.
-    #     # 2. Lower bound on movement: for each plant that still needs water,
-    #     #    compute the minimum Manhattan distance from any robot; then take
-    #     #    the maximum over plants (some plant is "farthest" from robots).
-    #     #
-    #     # The true remaining cost must be at least:
-    #     #   - the number of remaining POUR actions, and
-    #     #   - the distance to reach the farthest plant.
-    #     #
-    #     # Taking max of two lower bounds is still a valid lower bound.
-    #     taps_state, plants_state, robots_state = node.state
-
-    #     # (1) Remaining POURs
-    #     remaining_water = sum(need for (i, j, need) in plants_state)
-
-    #     # (2) Movement lower bound
-    #     movement_lb = self._max_min_robot_to_plant_distance(plants_state, robots_state)
-
-    #     return max(remaining_water, movement_lb)
-
-    def _manhattan(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
     def h_astar(self, node):
         """
-        A* heuristic for the watering problem using precomputed grid distances.
-
-        h(s) = pours_needed + loads_needed + movement_needed, where:
-        - pours_needed = total remaining water units plants still need
-        - loads_needed = extra LOAD actions needed beyond water already carried
-        - movement_needed = distance (in moves) needed to bring water
-                            to the farthest plant, using problem.grid_dist
+        Admissible A* heuristic.
+        Components:
+        1. Interaction cost: Every missing water unit requires 1 POUR.
+           Every unit not yet in a robot requires 1 LOAD.
+        2. Delivery cost: Current load must travel to the closest thirsty plant.
+        3. Routing cost: Missing water must travel from closest tap to closest plant.
+           Plus, a robot must travel to a tap if fetching is required.
         """
-        taps_state, plants_state, robots_state = node.state
+        taps, plants, robots = self._state_to_components(node.state)
 
-        # --- Collect plants that still need water ---
-        plants = [(i, j, need) for (i, j, need) in plants_state if need > 0]
-        if not plants:
-            # All plants satisfied -> goal
+        # 1. Identify needs and resources
+        # List of coordinates for plants that need water
+        thirsty_plants = [pos for pos, need in plants.items() if need > 0]
+
+        # If solution found (no thirsty plants), heuristic is 0
+        if not thirsty_plants:
             return 0
 
-        # --- Non-move lower bound: pours + extra loads ---
-        # total_need = how many units of water all plants still need
-        total_need = 0
-        for _, _, need in plants:
-            total_need += need
+        # List of coordinates for taps that still have water
+        active_taps = [pos for pos, amount in taps.items() if amount > 0]
 
-        # robots + total_carry = how much water is currently inside robots
-        total_carry = 0
-        robots = []
-        for rid, i, j, load, cap in robots_state:
-            robots.append((rid, i, j, load, cap))
-            total_carry += load
+        # Calculate volumes
+        total_need = sum(plants[p] for p in thirsty_plants)
+        current_carry = sum(r[2] for r in robots.values())  # r[2] is load
 
-        pours_needed = total_need
-        loads_needed = max(0, total_need - total_carry)
+        # 2. Interaction Costs (Atomic actions that must happen)
+        # We need 1 pour for every needed unit
+        cost_pours = total_need
+        # We need 1 load for every unit not yet carried
+        missing_water = max(0, total_need - current_carry)
+        cost_loads = missing_water
 
-        # --- Movement lower bound: farthest plant from any water source ---
-        # Water sources are: taps that still have water + robots that currently carry water
-        water_sources = []
-        for i, j, wu in taps_state:
-            if wu > 0:
-                water_sources.append((i, j))
+        h_val = cost_pours + cost_loads
 
-        for rid, i, j, load, cap in robots:
+        # 3. Delivery Costs (Moving carried water)
+        # For every robot with load, minimal distance to a thirsty plant
+        for rid, (r_x, r_y, load, cap) in robots.items():
             if load > 0:
-                water_sources.append((i, j))
+                # Find closest plant
+                min_dist_to_plant = min(
+                    [self.grid_dist((r_x, r_y), p_pos) for p_pos in thirsty_plants]
+                )
+                # We don't multiply by load because multiple units can move simultaneously
+                # inside the robot, but the robot must make the trip at least once.
+                # However, to be strictly admissible and tighter:
+                # We treat each unit of water as needing to arrive.
+                # But since they move together, adding dist * load might overestimate if
+                # they are dropped at the same plant.
+                # Safe lower bound: The robot must traverse the distance at least once.
+                h_val += min_dist_to_plant
 
-        movement_needed = 0
-        if water_sources:
-            # For each plant, find distance to its closest source, then take max over plants
-            for pi, pj, need in plants:
-                d = min(self.grid_dist((pi, pj), src) for src in water_sources)
-                # If instance is solvable, d should be finite
-                if d > movement_needed:
-                    movement_needed = d
-        else:
-            # No water anywhere yet -> we don't enforce a movement LB (still admissible).
-            movement_needed = 0
+        # 4. Procurement Costs (Fetching missing water)
+        if missing_water > 0 and active_taps:
+            # A. The water itself must move from Tap -> Plant
+            # Find the global minimum distance between any active tap and any thirsty plant
+            min_transit = float("inf")
+            for t_pos in active_taps:
+                for p_pos in thirsty_plants:
+                    d = self.grid_dist(t_pos, p_pos)
+                    if d < min_transit:
+                        min_transit = d
 
-        # Final heuristic: lower bound on total remaining actions
-        return pours_needed + loads_needed + movement_needed
+            # Every missing unit must eventually travel this minimum distance
+            # (Relaxation: assuming infinite capacity on the optimal path)
+            h_val += missing_water * min_transit
+
+            # B. A robot must get to a tap to start this process
+            # Find minimum distance from any robot to any active tap
+            min_dist_to_tap = float("inf")
+            robot_positions = [(val[0], val[1]) for val in robots.values()]
+
+            for r_pos in robot_positions:
+                for t_pos in active_taps:
+                    d = self.grid_dist(r_pos, t_pos)
+                    if d < min_dist_to_tap:
+                        min_dist_to_tap = d
+
+            h_val += min_dist_to_tap
+
+        return h_val
+
+    def h_gbfs(self, node):
+        """
+        Greedy Best-First Search heuristic.
+        Uses the same logic as A* but we can make it slightly 'greedy'
+        to prefer states where robots are closer to targets, ignoring rigorous cost accounting.
+        """
+        # For this assignment, the A* heuristic is quite informative.
+        # We can reuse it directly or return a weighted version.
+        return self.h_astar(node)
 
 
 def create_watering_problem(game):

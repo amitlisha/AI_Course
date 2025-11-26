@@ -13,13 +13,23 @@ class WateringProblem(search.Problem):
     def __init__(self, initial):
         """Constructor only needs the initial state.
         Don't forget to set the goal or implement the goal test"""
-        # initial is the init_state dictionary as described in the assignment.
-        # We store static parts (size, walls) on the problem instance and keep
-        # the dynamic parts (taps, plants, robots) inside the state.
+
+        # Grid / static environment
         self.size = initial["Size"]
         self.walls = frozenset(initial.get("Walls", set()))
 
-        # Each component of the state is immutable so that the whole state is hashable.
+        # Static tap positions (used by heuristic)
+        self.tap_positions = tuple(initial.get("Taps", {}).keys())
+
+        self._dist_to_tap = self._bfs_from_all_taps(self.tap_positions)
+
+        self._tap_distances = {}
+        for tap_pos in initial.get("Taps", {}):
+            self._tap_distances[tap_pos] = self._bfs_from(tap_pos)
+
+        self._reachable_to_plant = self._bfs_from_all_plants(initial.get("Plants", {}))
+
+        # --- Build initial state (same immutable tuple format you already had) ---
         taps_state = tuple(
             sorted((i, j, wu) for (i, j), wu in initial.get("Taps", {}).items())
         )
@@ -34,45 +44,100 @@ class WateringProblem(search.Problem):
         )
 
         initial_state = (taps_state, plants_state, robots_state)
-
-        self._precompute_distances()
-
         search.Problem.__init__(self, initial_state)
 
-    def _precompute_distances(self):
-        """Precompute shortest path distances between all free cells, respecting walls."""
+    def _bfs_from_all_plants(self, plants_dict):
+        """
+        Multi-source BFS starting from all plant positions.
+        We use this to find all cells from which at least one plant is reachable.
+        Returns a set of reachable cells.
+        """
         rows, cols = self.size
         walls = self.walls
-        self._dist = {}  # (i,j) -> dict[(i2,j2)] = distance
 
-        moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        from collections import deque
 
-        for si in range(rows):
-            for sj in range(cols):
-                if (si, sj) in walls:
-                    continue  # we never stand on walls
+        q = deque()
+        visited = set()
 
-                start = (si, sj)
-                d = {start: 0}
-                q = deque([start])
+        # Initialize with all plant positions
+        for i, j in plants_dict.keys():
+            visited.add((i, j))
+            q.append((i, j))
 
-                while q:
-                    i, j = q.popleft()
-                    for di, dj in moves:
-                        ni, nj = i + di, j + dj
-                        if not (0 <= ni < rows and 0 <= nj < cols):
-                            continue
-                        if (ni, nj) in walls:
-                            continue
-                        if (ni, nj) not in d:
-                            d[(ni, nj)] = d[(i, j)] + 1
-                            q.append((ni, nj))
+        while q:
+            i, j = q.popleft()
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < rows and 0 <= nj < cols):
+                    continue
+                if (ni, nj) in walls:
+                    continue
+                if (ni, nj) in visited:
+                    continue
+                visited.add((ni, nj))
+                q.append((ni, nj))
 
-                self._dist[start] = d
+        return visited
 
-    def grid_dist(self, a, b):
-        """Shortest-path distance between two cells, or a big number if unreachable."""
-        return self._dist.get(a, {}).get(b, float("inf"))
+    def _bfs_from(self, start):
+        """
+        BFS from a starting cell over the static grid (walls, bounds).
+        Returns a dict: cell -> shortest distance in moves.
+        """
+        rows, cols = self.size
+        walls = self.walls
+
+        dist = {start: 0}
+        q = deque([start])
+
+        while q:
+            i, j = q.popleft()
+            d = dist[(i, j)]
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < rows and 0 <= nj < cols):
+                    continue
+                if (ni, nj) in walls:
+                    continue
+                if (ni, nj) in dist:
+                    continue
+                dist[(ni, nj)] = d + 1
+                q.append((ni, nj))
+
+        return dist
+
+    def _bfs_from_all_taps(self, tap_positions):
+        """
+        Multi-source BFS from all taps simultaneously.
+        Returns a dict: cell -> distance to nearest tap.
+        """
+        rows, cols = self.size
+        walls = self.walls
+
+        dist = {}
+        q = deque()
+
+        # Initialize queue with all taps at distance 0
+        for pos in tap_positions:
+            dist[pos] = 0
+            q.append(pos)
+
+        while q:
+            i, j = q.popleft()
+            d = dist[(i, j)]
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < rows and 0 <= nj < cols):
+                    continue
+                if (ni, nj) in walls:
+                    continue
+                if (ni, nj) in dist:
+                    continue
+                dist[(ni, nj)] = d + 1
+                q.append((ni, nj))
+
+        return dist
 
     def _state_to_components(self, state):
         """Helper: converts a state tuple back to dictionaries."""
@@ -106,8 +171,18 @@ class WateringProblem(search.Problem):
         rows, cols = self.size
         walls = self.walls
 
+        # --- Global info for pruning ---
+        total_need = sum(need for need in plants.values() if need > 0)
+        total_load = sum(load for (_, _, load, _) in robots.values())
+
+        # If total_load >= total_need, we already carry enough water to satisfy all plants.
+        # Any further LOAD is useless in an optimal plan.
+        forbid_loads = total_need > 0 and total_load >= total_need
+
         # Map occupied cells to robot ids to prevent collisions
         occupied = {(i, j): rid for rid, (i, j, load, capacity) in robots.items()}
+
+        reachable_to_plant = self._reachable_to_plant
 
         for rid, (i, j, load, capacity) in robots.items():
             # Movement actions
@@ -131,6 +206,10 @@ class WateringProblem(search.Problem):
                 if (ni, nj) in occupied:
                     continue
 
+                # --- Region pruning: don't move into cells from which no plant is reachable ---
+                if reachable_to_plant and (ni, nj) not in reachable_to_plant:
+                    continue
+
                 robots_new = dict(robots)
                 robots_new[rid] = (ni, nj, load, capacity)
 
@@ -141,7 +220,12 @@ class WateringProblem(search.Problem):
             pos = (i, j)
 
             # Load action: robot on a tap, tap has water, robot not at capacity
-            if pos in taps and load < capacity and taps[pos] > 0:
+            if (
+                pos in taps
+                and load < capacity
+                and taps[pos] > 0
+                and not forbid_loads  # pruning: don't load if we already have enough water globally
+            ):
                 taps_new = dict(taps)
                 taps_new[pos] = taps[pos] - 1
 
@@ -177,95 +261,109 @@ class WateringProblem(search.Problem):
     def h_astar(self, node):
         """
         Admissible A* heuristic.
-        Components:
-        1. Interaction cost: Every missing water unit requires 1 POUR.
-           Every unit not yet in a robot requires 1 LOAD.
-        2. Delivery cost: Current load must travel to the closest thirsty plant.
-        3. Routing cost: Missing water must travel from closest tap to closest plant.
-           Plus, a robot must travel to a tap if fetching is required.
+
+        - For general cases (multi taps/robots):
+            h = remaining LOADs + remaining POURs
+                + min(robot -> tap)
+                + max(tap -> thirsty plant)
+
+        - For the special case of 1 tap & 1 robot:
+            add a strong lower bound on future tap<->plant tours
+            using the "grouping units into tours" idea.
         """
-        taps, plants, robots = self._state_to_components(node.state)
+        state = node.state
+        taps_state, plants_state, robots_state = state
 
-        # 1. Identify needs and resources
-        # List of coordinates for plants that need water
-        thirsty_plants = [pos for pos, need in plants.items() if need > 0]
+        # --- Rebuild simple dicts from tuples ---
+        plants = {(i, j): need for (i, j, need) in plants_state}
+        robots = {rid: (i, j, load, cap) for (rid, i, j, load, cap) in robots_state}
 
-        # If solution found (no thirsty plants), heuristic is 0
-        if not thirsty_plants:
+        # --- 1. Remaining need & loads ---
+        total_need = sum(need for need in plants.values() if need > 0)
+        if total_need == 0:
             return 0
 
-        # List of coordinates for taps that still have water
-        active_taps = [pos for pos, amount in taps.items() if amount > 0]
+        total_load = sum(load for (_, _, load, _) in robots.values())
+        remaining_loads = max(total_need - total_load, 0)
+        remaining_pours = total_need
 
-        # Calculate volumes
-        total_need = sum(plants[p] for p in thirsty_plants)
-        current_carry = sum(r[2] for r in robots.values())  # r[2] is load
+        h = remaining_loads + remaining_pours
 
-        # 2. Interaction Costs (Atomic actions that must happen)
-        # We need 1 pour for every needed unit
-        cost_pours = total_need
-        # We need 1 load for every unit not yet carried
-        missing_water = max(0, total_need - current_carry)
-        cost_loads = missing_water
+        # If we don't need any more loads OR no taps/robots -> no tap-based movement bound
+        if remaining_loads == 0 or not self.tap_positions or not robots:
+            return h
 
-        h_val = cost_pours + cost_loads
+        dist_to_tap = self._dist_to_tap
 
-        # 3. Delivery Costs (Moving carried water)
-        # For every robot with load, minimal distance to a thirsty plant
-        for rid, (r_x, r_y, load, cap) in robots.items():
-            if load > 0:
-                # Find closest plant
-                min_dist_to_plant = min(
-                    [self.grid_dist((r_x, r_y), p_pos) for p_pos in thirsty_plants]
-                )
-                # We don't multiply by load because multiple units can move simultaneously
-                # inside the robot, but the robot must make the trip at least once.
-                # However, to be strictly admissible and tighter:
-                # We treat each unit of water as needing to arrive.
-                # But since they move together, adding dist * load might overestimate if
-                # they are dropped at the same plant.
-                # Safe lower bound: The robot must traverse the distance at least once.
-                h_val += min_dist_to_plant
+        # --- 2. D_RT: min robot -> nearest tap distance ---
+        min_robot_to_tap = None
+        for rid, (ri, rj, load, cap) in robots.items():
+            d = dist_to_tap.get((ri, rj))
+            if d is None:
+                continue
+            if min_robot_to_tap is None or d < min_robot_to_tap:
+                min_robot_to_tap = d
 
-        # 4. Procurement Costs (Fetching missing water)
-        if missing_water > 0 and active_taps:
-            # A. The water itself must move from Tap -> Plant
-            # Find the global minimum distance between any active tap and any thirsty plant
-            min_transit = float("inf")
-            for t_pos in active_taps:
-                for p_pos in thirsty_plants:
-                    d = self.grid_dist(t_pos, p_pos)
-                    if d < min_transit:
-                        min_transit = d
+        if min_robot_to_tap is None:
+            min_robot_to_tap = 0
 
-            # Every missing unit must eventually travel this minimum distance
-            # (Relaxation: assuming infinite capacity on the optimal path)
-            h_val += missing_water * min_transit
+        # --- 3. Generic plant distance bound: D_TP_single = farthest thirsty plant from taps ---
+        d_max = 0
+        plant_entries = []  # we'll also reuse this for the snake-specialized part
+        for pos, need in plants.items():
+            if need <= 0:
+                continue
+            d = dist_to_tap.get(pos)
+            if d is None:
+                continue
+            plant_entries.append((d, need))
+            if d > d_max:
+                d_max = d
 
-            # B. A robot must get to a tap to start this process
-            # Find minimum distance from any robot to any active tap
-            min_dist_to_tap = float("inf")
-            robot_positions = [(val[0], val[1]) for val in robots.values()]
+        D_TP_single = d_max if plant_entries else 0
 
-            for r_pos in robot_positions:
-                for t_pos in active_taps:
-                    d = self.grid_dist(r_pos, t_pos)
-                    if d < min_dist_to_tap:
-                        min_dist_to_tap = d
+        # --- 4. Extra strong bound only for 1 tap & 1 robot: D_cycles ---
+        D_cycles = 0
+        if len(robots) == 1 and len(self.tap_positions) == 1 and plant_entries:
+            # Build multiset of unit distances for remaining plant needs
+            unit_dists = []
+            for d, need in plant_entries:
+                if need > 0:
+                    unit_dists.extend([d] * need)
 
-            h_val += min_dist_to_tap
+            if unit_dists:
+                unit_dists.sort(reverse=True)
 
-        return h_val
+                # Optimistically use robot-held water to cover the farthest units
+                free_units = min(total_load, total_need)
+                if free_units < len(unit_dists):
+                    units_for_taps = unit_dists[
+                        free_units:
+                    ]  # these must come from taps
+                    N = len(units_for_taps)
 
-    def h_gbfs(self, node):
-        """
-        Greedy Best-First Search heuristic.
-        Uses the same logic as A* but we can make it slightly 'greedy'
-        to prefer states where robots are closer to targets, ignoring rigorous cost accounting.
-        """
-        # For this assignment, the A* heuristic is quite informative.
-        # We can reuse it directly or return a weighted version.
-        return self.h_astar(node)
+                    # Capacity of the single robot
+                    (_, (ri, rj, load, C_max)) = next(iter(robots.items()))
+                    C_max = max(C_max, 1)
+
+                    K = (N + C_max - 1) // C_max  # number of tours
+                    group_max = []
+                    for t in range(K):
+                        idx = t * C_max
+                        if idx < N:
+                            group_max.append(units_for_taps[idx])
+
+                    if group_max:
+                        S = sum(group_max)
+                        g_max = max(group_max)
+                        # Total tour length >= 2*S - g_max (last tour need not return)
+                        D_cycles = 2 * S - g_max
+
+        # Final tap->plant movement LB: generic max-distance OR the cycles bound
+        D_TP = max(D_TP_single, D_cycles)
+
+        h += min_robot_to_tap + D_TP
+        return h
 
 
 def create_watering_problem(game):
@@ -295,6 +393,14 @@ def experiment_heuristics_astar():
 
     Timeout:
       - 1 minute per run, enforced inside the heuristic (no multiprocessing, no signals)
+
+    Extra debug fields per run:
+      - heuristic_calls:    how many times the heuristic was evaluated
+      - heuristic_calls_per_sec
+      - h_min, h_max, h_avg: stats over heuristic values
+      - max_depth_seen:     max node.depth seen by the heuristic
+      - max_g_seen:         max node.path_cost seen
+      - max_f_seen:         max (g + h) seen
     """
     import time
     import pandas as pd
@@ -350,11 +456,45 @@ def experiment_heuristics_astar():
 
             start_time = time.time()
 
-            # Wrap the heuristic so it checks the wall-clock time on each call
-            def timed_h(node, _base_h=base_h, _start=start_time):
+            # --- instrumentation for heuristic/debug stats ---
+            stats = {
+                "calls": 0,
+                "sum_h": 0.0,
+                "min_h": float("inf"),
+                "max_h": float("-inf"),
+                "max_depth": 0,
+                "max_g": 0.0,
+                "max_f": 0.0,
+            }
+
+            def timed_h(node, _base_h=base_h, _start=start_time, _stats=stats):
+                # timeout check
                 if time.time() - _start > TIMEOUT:
                     raise TimeoutException()
-                return _base_h(node)
+
+                h_val = _base_h(node)
+
+                # update stats
+                _stats["calls"] += 1
+                _stats["sum_h"] += h_val
+                if h_val < _stats["min_h"]:
+                    _stats["min_h"] = h_val
+                if h_val > _stats["max_h"]:
+                    _stats["max_h"] = h_val
+
+                depth = getattr(node, "depth", 0)
+                if depth > _stats["max_depth"]:
+                    _stats["max_depth"] = depth
+
+                g = getattr(node, "path_cost", 0.0)
+                if g > _stats["max_g"]:
+                    _stats["max_g"] = g
+
+                f = g + h_val
+                if f > _stats["max_f"]:
+                    _stats["max_f"] = f
+
+                return h_val
 
             solved = False
             solution_length = None
@@ -379,6 +519,13 @@ def experiment_heuristics_astar():
                 # No node returned and no explicit error → treat as no solution
                 err = "NO_SOLUTION"
 
+            # derive stats
+            calls = stats["calls"]
+            h_min = None if stats["min_h"] == float("inf") else stats["min_h"]
+            h_max = None if stats["max_h"] == float("-inf") else stats["max_h"]
+            h_avg = stats["sum_h"] / calls if calls > 0 else None
+            calls_per_sec = calls / runtime if runtime > 0 and calls > 0 else None
+
             rows.append(
                 {
                     "problem": prob_name,
@@ -388,6 +535,15 @@ def experiment_heuristics_astar():
                     "optimal_length": optimal_len,
                     "runtime_sec": runtime,
                     "error": err,
+                    # --- new debug fields ---
+                    "heuristic_calls": calls,
+                    "heuristic_calls_per_sec": calls_per_sec,
+                    "h_min": h_min,
+                    "h_max": h_max,
+                    "h_avg": h_avg,
+                    "max_depth_seen": stats["max_depth"],
+                    "max_g_seen": stats["max_g"],
+                    "max_f_seen": stats["max_f"],
                 }
             )
 

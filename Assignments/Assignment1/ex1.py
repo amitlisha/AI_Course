@@ -43,6 +43,8 @@ class WateringProblem(search.Problem):
             )
         )
 
+        self._single_tr_lb_cache = {}
+
         initial_state = (taps_state, plants_state, robots_state)
         search.Problem.__init__(self, initial_state)
 
@@ -164,7 +166,7 @@ class WateringProblem(search.Problem):
         return (taps_state, plants_state, robots_state)
 
     def successor(self, state):
-        """Generates the successor states returns [(action, achieved_states, ...)]"""
+        """Generates the successor states returns [(action, achieved_state), ...]"""
         successors = []
 
         taps, plants, robots = self._state_to_components(state)
@@ -328,51 +330,66 @@ class WateringProblem(search.Problem):
         LB_trips_per_plant = 0
 
         if len(robots) == 1 and len(self.tap_positions) == 1 and plant_entries:
-            # Build multiset of unit distances for remaining plant needs
-            unit_dists = []
-            for d, need in plant_entries:
-                if need > 0:
-                    unit_dists.extend([d] * need)
+            # Capacity of the single robot
+            (_, (ri, rj, load, C_max)) = next(iter(robots.items()))
+            C_max = max(C_max, 1)
 
-            if unit_dists:
-                unit_dists.sort(reverse=True)
+            # We clamp free_units the same way as in the computation
+            free_units = min(total_load, total_need)
 
-                # Optimistically use robot-held water to cover the farthest units
-                free_units = min(total_load, total_need)
-                if free_units < len(unit_dists):
-                    units_for_taps = unit_dists[
-                        free_units:
-                    ]  # these must come from taps
-                    N = len(units_for_taps)
+            # Build a canonical key: only plant distances & needs matter, not positions or order.
+            # plant_entries is [(d, need), ...]; we sort it to make the key canonical.
+            key_plant = tuple(
+                sorted((d, need) for (d, need) in plant_entries if need > 0)
+            )
+            cache_key = (free_units, C_max, key_plant)
 
-                    # Capacity of the single robot
-                    (_, (ri, rj, load, C_max)) = next(iter(robots.items()))
-                    C_max = max(C_max, 1)
+            cached = self._single_tr_lb_cache.get(cache_key)
+            if cached is not None:
+                D_cycles, LB_trips_per_plant = cached
+            else:
+                # --- Heavy computation done only once per pattern ---
 
-                    # (a) Grouped tours bound (existing D_cycles)
-                    K = (N + C_max - 1) // C_max  # number of tours
-                    group_max = []
-                    for t in range(K):
-                        idx = t * C_max
-                        if idx < N:
-                            group_max.append(units_for_taps[idx])
+                # Build multiset of unit distances for remaining plant needs
+                unit_dists = []
+                for d, need in plant_entries:
+                    if need > 0:
+                        unit_dists.extend([d] * need)
 
-                    if group_max:
-                        S = sum(group_max)
-                        g_max = max(group_max)
-                        # Total tour length >= 2*S - g_max (last tour need not return)
-                        D_cycles = 2 * S - g_max
+                if unit_dists:
+                    unit_dists.sort(reverse=True)
 
-                    # (b) Per-plant "trips" bound: for each plant, at least ceil(need/C_max) tours
-                    # reaching distance d. We ignore robot's current load here (treat all need
-                    # as coming from taps) to stay safely optimistic.
-                    for d, need in plant_entries:
-                        if need <= 0:
-                            continue
-                        k_p = (need + C_max - 1) // C_max  # ceil(need / C_max)
-                        L_p = (2 * k_p - 1) * d
-                        if L_p > LB_trips_per_plant:
-                            LB_trips_per_plant = L_p
+                    if free_units < len(unit_dists):
+                        units_for_taps = unit_dists[
+                            free_units:
+                        ]  # these must come from taps
+                        N = len(units_for_taps)
+
+                        # (a) Grouped tours bound (D_cycles)
+                        K = (N + C_max - 1) // C_max  # number of tours
+                        group_max = []
+                        for t in range(K):
+                            idx = t * C_max
+                            if idx < N:
+                                group_max.append(units_for_taps[idx])
+
+                        if group_max:
+                            S = sum(group_max)
+                            g_max = max(group_max)
+                            # Total tour length >= 2*S - g_max (last tour need not return)
+                            D_cycles = 2 * S - g_max
+
+                        # (b) Per-plant "trips" bound
+                        for d, need in plant_entries:
+                            if need <= 0:
+                                continue
+                            k_p = (need + C_max - 1) // C_max  # ceil(need / C_max)
+                            L_p = (2 * k_p - 1) * d
+                            if L_p > LB_trips_per_plant:
+                                LB_trips_per_plant = L_p
+
+                # Store in cache (even if both are 0 – that’s still a valid result)
+                self._single_tr_lb_cache[cache_key] = (D_cycles, LB_trips_per_plant)
 
         # Final tap->plant movement LB: generic max-distance OR the cycles bound OR per-plant bound
         D_TP = max(D_TP_single, D_cycles, LB_trips_per_plant)

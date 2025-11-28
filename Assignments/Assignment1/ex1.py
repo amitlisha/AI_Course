@@ -185,6 +185,14 @@ class WateringProblem(search.Problem):
         occupied = {(i, j): rid for rid, (i, j, load, capacity) in robots.items()}
 
         reachable_to_plant = self._reachable_to_plant
+        dist_to_tap = self._dist_to_tap
+
+        # Single-tap info (used for corridor forcing when robot is empty)
+        single_tap_mode = len(self.tap_positions) == 1
+        tap_has_water = False
+        if single_tap_mode:
+            tap_pos = next(iter(self.tap_positions))
+            tap_has_water = taps.get(tap_pos, 0) > 0
 
         for rid, (i, j, load, capacity) in robots.items():
             # Movement actions
@@ -194,6 +202,20 @@ class WateringProblem(search.Problem):
                 ("LEFT", (0, -1)),
                 ("RIGHT", (0, 1)),
             ]
+
+            # --- Corridor forcing: when empty, force a shortest-path move to the tap ---
+            force_tap_corridor = False
+            if single_tap_mode and load == 0 and total_need > 0 and tap_has_water:
+                d_here = dist_to_tap.get((i, j))
+                # If we are not already on the tap and the tap is reachable from here,
+                # an optimal solution can always choose to go monotonically "downhill"
+                # in dist_to_tap until reaching the tap.
+                if d_here is not None and d_here > 0:
+                    force_tap_corridor = True
+                else:
+                    force_tap_corridor = False
+            else:
+                d_here = None  # not used
 
             for move_name, (di, dj) in moves:
                 ni, nj = i + di, j + dj
@@ -211,6 +233,14 @@ class WateringProblem(search.Problem):
                 # --- Region pruning: don't move into cells from which no plant is reachable ---
                 if reachable_to_plant and (ni, nj) not in reachable_to_plant:
                     continue
+
+                # --- Apply corridor forcing when appropriate ---
+                if force_tap_corridor:
+                    d_next = dist_to_tap.get((ni, nj))
+                    # Only allow moves that strictly reduce dist_to_tap
+                    # (i.e., stay on some shortest path to the tap).
+                    if d_next is None or d_next != d_here - 1:
+                        continue
 
                 robots_new = dict(robots)
                 robots_new[rid] = (ni, nj, load, capacity)

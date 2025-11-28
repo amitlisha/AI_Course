@@ -273,34 +273,32 @@ class WateringProblem(search.Problem):
             add strong lower bounds on future tap<->plant tours:
             (a) grouping units into tours (D_cycles)
             (b) per-plant 'trips' bound (LB_trips_per_plant).
-        """
-        state = node.state
-        taps_state, plants_state, robots_state = state
 
-        # --- Rebuild simple dicts from tuples ---
-        plants = {(i, j): need for (i, j, need) in plants_state}
-        robots = {rid: (i, j, load, cap) for (rid, i, j, load, cap) in robots_state}
+        This version restores the full logic (including D_cycles) but avoids
+        rebuilding dicts on every call by operating directly on the tuple state.
+        """
+        taps_state, plants_state, robots_state = node.state
 
         # --- 1. Remaining need & loads ---
-        total_need = sum(need for need in plants.values() if need > 0)
+        total_need = sum(need for (_, _, need) in plants_state if need > 0)
         if total_need == 0:
             return 0
 
-        total_load = sum(load for (_, _, load, _) in robots.values())
+        total_load = sum(load for (_, _, _, load, _) in robots_state)
         remaining_loads = max(total_need - total_load, 0)
         remaining_pours = total_need
 
         h = remaining_loads + remaining_pours
 
         # If we don't need any more loads OR no taps/robots -> no tap-based movement bound
-        if remaining_loads == 0 or not self.tap_positions or not robots:
+        if remaining_loads == 0 or not self.tap_positions or not robots_state:
             return h
 
         dist_to_tap = self._dist_to_tap
 
         # --- 2. D_RT: min robot -> nearest tap distance ---
         min_robot_to_tap = None
-        for rid, (ri, rj, load, cap) in robots.items():
+        for _, ri, rj, load, cap in robots_state:
             d = dist_to_tap.get((ri, rj))
             if d is None:
                 continue
@@ -312,11 +310,11 @@ class WateringProblem(search.Problem):
 
         # --- 3. Generic plant distance bound: D_TP_single = farthest thirsty plant from taps ---
         d_max = 0
-        plant_entries = []  # we'll also reuse this for the snake-specialized part
-        for pos, need in plants.items():
+        plant_entries = []  # (distance_from_nearest_tap, need)
+        for pi, pj, need in plants_state:
             if need <= 0:
                 continue
-            d = dist_to_tap.get(pos)
+            d = dist_to_tap.get((pi, pj))
             if d is None:
                 continue
             plant_entries.append((d, need))
@@ -329,16 +327,15 @@ class WateringProblem(search.Problem):
         D_cycles = 0
         LB_trips_per_plant = 0
 
-        if len(robots) == 1 and len(self.tap_positions) == 1 and plant_entries:
+        if len(robots_state) == 1 and len(self.tap_positions) == 1 and plant_entries:
             # Capacity of the single robot
-            (_, (ri, rj, load, C_max)) = next(iter(robots.items()))
+            (_, ri, rj, load, C_max) = robots_state[0]
             C_max = max(C_max, 1)
 
-            # We clamp free_units the same way as in the computation
+            # free_units: units not forced to originate from taps
             free_units = min(total_load, total_need)
 
             # Build a canonical key: only plant distances & needs matter, not positions or order.
-            # plant_entries is [(d, need), ...]; we sort it to make the key canonical.
             key_plant = tuple(
                 sorted((d, need) for (d, need) in plant_entries if need > 0)
             )
@@ -348,9 +345,9 @@ class WateringProblem(search.Problem):
             if cached is not None:
                 D_cycles, LB_trips_per_plant = cached
             else:
-                # --- Heavy computation done only once per pattern ---
+                # --- Heavy computation done only once per (free_units, C_max, pattern) ---
 
-                # Build multiset of unit distances for remaining plant needs
+                # Multiset of unit distances (one entry per remaining unit of need)
                 unit_dists = []
                 for d, need in plant_entries:
                     if need > 0:
@@ -360,13 +357,14 @@ class WateringProblem(search.Problem):
                     unit_dists.sort(reverse=True)
 
                     if free_units < len(unit_dists):
-                        units_for_taps = unit_dists[
-                            free_units:
-                        ]  # these must come from taps
+                        # units_for_taps: those units that must still be fetched from taps
+                        units_for_taps = unit_dists[free_units:]
                         N = len(units_for_taps)
 
                         # (a) Grouped tours bound (D_cycles)
-                        K = (N + C_max - 1) // C_max  # number of tours
+                        K = (
+                            N + C_max - 1
+                        ) // C_max  # number of tours with capacity C_max
                         group_max = []
                         for t in range(K):
                             idx = t * C_max

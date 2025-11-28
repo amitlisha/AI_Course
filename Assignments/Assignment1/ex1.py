@@ -268,8 +268,9 @@ class WateringProblem(search.Problem):
                 + max(tap -> thirsty plant)
 
         - For the special case of 1 tap & 1 robot:
-            add a strong lower bound on future tap<->plant tours
-            using the "grouping units into tours" idea.
+            add strong lower bounds on future tap<->plant tours:
+            (a) grouping units into tours (D_cycles)
+            (b) per-plant 'trips' bound (LB_trips_per_plant).
         """
         state = node.state
         taps_state, plants_state, robots_state = state
@@ -322,8 +323,10 @@ class WateringProblem(search.Problem):
 
         D_TP_single = d_max if plant_entries else 0
 
-        # --- 4. Extra strong bound only for 1 tap & 1 robot: D_cycles ---
+        # --- 4. Extra strong bounds only for 1 tap & 1 robot ---
         D_cycles = 0
+        LB_trips_per_plant = 0
+
         if len(robots) == 1 and len(self.tap_positions) == 1 and plant_entries:
             # Build multiset of unit distances for remaining plant needs
             unit_dists = []
@@ -346,6 +349,7 @@ class WateringProblem(search.Problem):
                     (_, (ri, rj, load, C_max)) = next(iter(robots.items()))
                     C_max = max(C_max, 1)
 
+                    # (a) Grouped tours bound (existing D_cycles)
                     K = (N + C_max - 1) // C_max  # number of tours
                     group_max = []
                     for t in range(K):
@@ -359,8 +363,19 @@ class WateringProblem(search.Problem):
                         # Total tour length >= 2*S - g_max (last tour need not return)
                         D_cycles = 2 * S - g_max
 
-        # Final tap->plant movement LB: generic max-distance OR the cycles bound
-        D_TP = max(D_TP_single, D_cycles)
+                    # (b) Per-plant "trips" bound: for each plant, at least ceil(need/C_max) tours
+                    # reaching distance d. We ignore robot's current load here (treat all need
+                    # as coming from taps) to stay safely optimistic.
+                    for d, need in plant_entries:
+                        if need <= 0:
+                            continue
+                        k_p = (need + C_max - 1) // C_max  # ceil(need / C_max)
+                        L_p = (2 * k_p - 1) * d
+                        if L_p > LB_trips_per_plant:
+                            LB_trips_per_plant = L_p
+
+        # Final tap->plant movement LB: generic max-distance OR the cycles bound OR per-plant bound
+        D_TP = max(D_TP_single, D_cycles, LB_trips_per_plant)
 
         h += min_robot_to_tap + D_TP
         return h

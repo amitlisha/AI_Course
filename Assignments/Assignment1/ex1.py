@@ -44,6 +44,8 @@ class WateringProblem(search.Problem):
         )
 
         self._single_tr_lb_cache = {}
+        self._h_astar_cache = {}
+        self._h_gbfs_cache = {}
 
         initial_state = (taps_state, plants_state, robots_state)
         search.Problem.__init__(self, initial_state)
@@ -306,23 +308,33 @@ class WateringProblem(search.Problem):
 
         This version restores the full logic (including D_cycles) but avoids
         rebuilding dicts on every call by operating directly on the tuple state.
+        Also caches state -> heuristic value.
         """
-        taps_state, plants_state, robots_state = node.state
+        state = node.state
+
+        # --- Cache check ---
+        cached = self._h_astar_cache.get(state)
+        if cached is not None:
+            return cached
+
+        taps_state, plants_state, robots_state = state
 
         # --- 1. Remaining need & loads ---
         total_need = sum(need for (_, _, need) in plants_state if need > 0)
         if total_need == 0:
+            self._h_astar_cache[state] = 0
             return 0
 
         total_load = sum(load for (_, _, _, load, _) in robots_state)
         remaining_loads = max(total_need - total_load, 0)
         remaining_pours = total_need
 
-        h = remaining_loads + remaining_pours
+        h_val = remaining_loads + remaining_pours
 
         # If we don't need any more loads OR no taps/robots -> no tap-based movement bound
         if remaining_loads == 0 or not self.tap_positions or not robots_state:
-            return h
+            self._h_astar_cache[state] = h_val
+            return h_val
 
         dist_to_tap = self._dist_to_tap
 
@@ -371,9 +383,9 @@ class WateringProblem(search.Problem):
             )
             cache_key = (free_units, C_max, key_plant)
 
-            cached = self._single_tr_lb_cache.get(cache_key)
-            if cached is not None:
-                D_cycles, LB_trips_per_plant = cached
+            cached_pair = self._single_tr_lb_cache.get(cache_key)
+            if cached_pair is not None:
+                D_cycles, LB_trips_per_plant = cached_pair
             else:
                 # --- Heavy computation done only once per (free_units, C_max, pattern) ---
 
@@ -422,8 +434,104 @@ class WateringProblem(search.Problem):
         # Final tap->plant movement LB: generic max-distance OR the cycles bound OR per-plant bound
         D_TP = max(D_TP_single, D_cycles, LB_trips_per_plant)
 
-        h += min_robot_to_tap + D_TP
-        return h
+        h_val += min_robot_to_tap + D_TP
+
+        # --- Store in cache and return ---
+        self._h_astar_cache[state] = h_val
+        return h_val
+
+    def h_gbfs(self, node):
+        """
+        Greedy Best-First Search heuristic (can be non-admissible).
+
+        Idea:
+        - Count remaining interactions (LOAD + POUR), like in A*.
+        - Add a cheap estimate of movement:
+          * min robot->tap distance (using precomputed dist_to_tap).
+          * approximate total tap->plant travel, based on:
+                sum_over_plants(need * dist_to_nearest_tap(plant)) / avg_capacity
+
+        This is cheap (O(#robots + #plants)) and correlates well with how much work
+        remains, but it is allowed to overestimate (GBFS doesn't require admissibility).
+        We also cache state -> heuristic value.
+        """
+        state = node.state
+
+        # --- Cache check ---
+        cached = self._h_gbfs_cache.get(state)
+        if cached is not None:
+            return cached
+
+        taps_state, plants_state, robots_state = state
+
+        # --- 1. Remaining water need ---
+        total_need = 0
+        for _, _, need in plants_state:
+            if need > 0:
+                total_need += need
+
+        if total_need == 0:
+            self._h_gbfs_cache[state] = 0
+            return 0
+
+        # If there are no robots, just return something large-ish.
+        if not robots_state:
+            val = 10 * total_need
+            self._h_gbfs_cache[state] = val
+            return val
+
+        # --- 2. Current total load on robots ---
+        total_load = 0
+        total_capacity = 0
+        for _, _, _, load, cap in robots_state:
+            total_load += load
+            total_capacity += cap
+
+        remaining_loads = max(total_need - total_load, 0)
+        remaining_pours = total_need
+
+        # Base interaction cost (LOAD + POUR)
+        h_val = remaining_loads + remaining_pours
+
+        # If there are no taps, we can't use tap distances for movement.
+        if not self.tap_positions or not self._dist_to_tap:
+            self._h_gbfs_cache[state] = h_val
+            return h_val
+
+        dist_to_tap = self._dist_to_tap
+
+        # --- 3. Min robot -> nearest tap distance (D_RT) ---
+        min_robot_to_tap = None
+        for _, ri, rj, load, cap in robots_state:
+            d = dist_to_tap.get((ri, rj))
+            if d is None:
+                continue
+            if (min_robot_to_tap is None) or (d < min_robot_to_tap):
+                min_robot_to_tap = d
+
+        if min_robot_to_tap is None:
+            min_robot_to_tap = 0
+
+        # --- 4. Approximate total tap -> plant movement ---
+        sum_need_dist = 0
+        for pi, pj, need in plants_state:
+            if need <= 0:
+                continue
+            d = dist_to_tap.get((pi, pj))
+            if d is None:
+                continue
+            sum_need_dist += need * d
+
+        # Use an average capacity to approximate how many "tours" are needed.
+        avg_capacity = max(1, total_capacity // max(1, len(robots_state)))
+        approx_tap_to_plants = sum_need_dist // avg_capacity
+
+        # Final GBFS heuristic
+        h_val += min_robot_to_tap + approx_tap_to_plants
+
+        # --- Store in cache and return ---
+        self._h_gbfs_cache[state] = h_val
+        return h_val
 
 
 def create_watering_problem(game):
@@ -443,36 +551,20 @@ import utils
 # ---------- Experiment / Testing Utilities ----------
 
 
-def experiment_heuristics_astar():
+def experiment_search_methods():
     """
-    Run A* with several heuristics on a selection of problems from ex1_check and
-    collect results into a pandas DataFrame.
-
-    Heuristics compared:
-      - h_improved_astar (h_astar): max(remaining_water, movement_lb)
-
-    Timeout:
-      - 1 minute per run, enforced inside the heuristic (no multiprocessing, no signals)
-
-    Extra debug fields per run:
-      - heuristic_calls:    how many times the heuristic was evaluated
-      - heuristic_calls_per_sec
-      - h_min, h_max, h_avg: stats over heuristic values
-      - max_depth_seen:     max node.depth seen by the heuristic
-      - max_g_seen:         max node.path_cost seen
-      - max_f_seen:         max (g + h) seen
+    Unified benchmark runner for both A* (with h_astar) and GBFS (with h_gbfs).
+    Produces one combined results DataFrame.
     """
     import time
     import pandas as pd
 
-    TIMEOUT = 60  # seconds
+    TIMEOUT = 60  # Seconds per run
 
     class TimeoutException(Exception):
-        """Raised when a single search run exceeds TIMEOUT seconds."""
-
         pass
 
-    # List of (problem_name, problem_dict, optimal_solution_length_or_None)
+    # List of problems: (name, dict, optimal_solution_len)
     problems = [
         ("Problem_pdf", ex1_check.Problem_pdf, 20),
         ("problem1", ex1_check.problem1, 8),
@@ -494,117 +586,98 @@ def experiment_heuristics_astar():
         ("problem_12x12_snake_hard", ex1_check.problem_12x12_snake_hard, 343),
     ]
 
-    # Heuristics to compare: name -> function-getter on WateringProblem
-    def get_h_improved(p):
-        return p.h_astar
-
-    heuristics = [
-        ("h_improved_astar", get_h_improved),
+    # Algorithms to run: label, search_fn, heuristic_getter
+    methods = [
+        ("A*", search.astar_search, lambda P: P.h_astar),
+        ("GBFS", search.greedy_best_first_graph_search, lambda P: P.h_gbfs),
     ]
 
     rows = []
-    total = len(problems) * len(heuristics)
+    total = len(problems) * len(methods)
     counter = 0
 
     for prob_name, prob_def, optimal_len in problems:
-        for h_name, h_getter in heuristics:
+        for alg_name, search_fn, h_get in methods:
             counter += 1
-            print(f"[{counter}/{total}] Running {prob_name} with {h_name} ...")
+            print(f"[{counter}/{total}] {alg_name} on {prob_name}")
 
             problem = create_watering_problem(prob_def)
-            base_h = h_getter(problem)
+            base_h = h_get(problem)
 
             start_time = time.time()
-
-            # --- instrumentation for heuristic/debug stats ---
             stats = {
                 "calls": 0,
-                "sum_h": 0.0,
+                "sum_h": 0,
                 "min_h": float("inf"),
                 "max_h": float("-inf"),
                 "max_depth": 0,
-                "max_g": 0.0,
-                "max_f": 0.0,
+                "max_g": 0,
+                "max_f": 0,
             }
 
-            def timed_h(node, _base_h=base_h, _start=start_time, _stats=stats):
-                # timeout check
+            # Decorated heuristic with timeout + instrumentation
+            def H(node, _h=base_h, _start=start_time, _stats=stats):
                 if time.time() - _start > TIMEOUT:
                     raise TimeoutException()
 
-                h_val = _base_h(node)
-
-                # update stats
+                v = _h(node)
                 _stats["calls"] += 1
-                _stats["sum_h"] += h_val
-                if h_val < _stats["min_h"]:
-                    _stats["min_h"] = h_val
-                if h_val > _stats["max_h"]:
-                    _stats["max_h"] = h_val
+                _stats["sum_h"] += v
+                _stats["min_h"] = min(_stats["min_h"], v)
+                _stats["max_h"] = max(_stats["max_h"], v)
 
-                depth = getattr(node, "depth", 0)
-                if depth > _stats["max_depth"]:
-                    _stats["max_depth"] = depth
+                d = getattr(node, "depth", 0)
+                g = getattr(node, "path_cost", 0)
+                f = g + v
+                _stats["max_depth"] = max(_stats["max_depth"], d)
+                _stats["max_g"] = max(_stats["max_g"], g)
+                _stats["max_f"] = max(_stats["max_f"], f)
 
-                g = getattr(node, "path_cost", 0.0)
-                if g > _stats["max_g"]:
-                    _stats["max_g"] = g
+                return v
 
-                f = g + h_val
-                if f > _stats["max_f"]:
-                    _stats["max_f"] = f
-
-                return h_val
-
-            solved = False
-            solution_length = None
-            err = None
-            result = None
+            solved, solution_length, err = False, None, None
 
             try:
-                result = search.astar_search(problem, timed_h)
+                result = search_fn(problem, H)
             except TimeoutException:
                 err = "TIMEOUT"
+                result = None
             except Exception as e:
                 err = str(e)
+                result = None
 
             runtime = time.time() - start_time
 
             if result and isinstance(result[0], search.Node):
                 solved = True
                 path = result[0].path()[::-1]
-                actions = [pi.action for pi in path][1:]
+                actions = [n.action for n in path][1:]
                 solution_length = len(actions)
             elif err is None:
-                # No node returned and no explicit error → treat as no solution
                 err = "NO_SOLUTION"
 
-            # derive stats
-            calls = stats["calls"]
-            h_min = None if stats["min_h"] == float("inf") else stats["min_h"]
-            h_max = None if stats["max_h"] == float("-inf") else stats["max_h"]
-            h_avg = stats["sum_h"] / calls if calls > 0 else None
-            calls_per_sec = calls / runtime if runtime > 0 and calls > 0 else None
+            calls = stats["calls"] or 1
+            h_avg = stats["sum_h"] / calls
+            calls_per_sec = calls / runtime if runtime else None
 
             rows.append(
-                {
-                    "problem": prob_name,
-                    "heuristic": h_name,
-                    "solved": solved,
-                    "solution_length": solution_length,
-                    "optimal_length": optimal_len,
-                    "runtime_sec": runtime,
-                    "error": err,
-                    # --- new debug fields ---
-                    "heuristic_calls": calls,
-                    "heuristic_calls_per_sec": calls_per_sec,
-                    "h_min": h_min,
-                    "h_max": h_max,
-                    "h_avg": h_avg,
-                    "max_depth_seen": stats["max_depth"],
-                    "max_g_seen": stats["max_g"],
-                    "max_f_seen": stats["max_f"],
-                }
+                dict(
+                    problem=prob_name,
+                    algorithm=alg_name,
+                    solved=solved,
+                    solution_length=solution_length,
+                    optimal_length=optimal_len,
+                    runtime_sec=runtime,
+                    error=err,
+                    heuristic_calls=calls,
+                    heuristic_calls_per_sec=calls_per_sec,
+                    h_min=stats["min_h"],
+                    h_max=stats["max_h"],
+                    h_avg=h_avg,
+                    max_depth_seen=stats["max_depth"],
+                    max_g_seen=stats["max_g"],
+                    max_f_seen=stats["max_f"],
+                )
             )
 
     df = pd.DataFrame(rows)
